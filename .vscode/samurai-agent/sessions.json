@@ -1,0 +1,23 @@
+[
+  {
+    "id": "b320afaa-7a41-4a3d-abe8-ec5e73d97f64",
+    "title": "New Conversation",
+    "status": "active",
+    "messageCount": 0,
+    "totalTokens": 0,
+    "totalCost": 0,
+    "lastMessageAt": "2026-02-28T00:06:33.708Z",
+    "tags": [],
+    "metadata": {
+      "projectId": "default-project",
+      "model": "free-trial-model-with-daily-limit",
+      "mode": "debugging",
+      "connectedCodebasePath": "/home/user/cierp"
+    },
+    "codeContextIds": [],
+    "previous_session_intent": "pure_discussion",
+    "pinnedFilePaths": [],
+    "createdAt": "2026-02-28T00:06:33.708Z",
+    "updatedAt": "2026-02-28T00:06:33.708Z"
+  }
+]
