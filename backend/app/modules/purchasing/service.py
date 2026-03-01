@@ -7,10 +7,12 @@ from datetime import datetime, timezone
 
 from app.modules.purchasing.models import PurchaseOrder, PurchaseOrderLine
 from app.modules.accounting.models import AccountMove, InvoiceLine
+from app.core.audit import audited
 from app.modules.inventory.service import create_receipt_picking, validate_picking
 
 
-async def confirm_purchase_order(db: AsyncSession, order: PurchaseOrder, tenant_id: str) -> PurchaseOrder:
+@audited("purchasing.orders.confirm", resource_type="purchase_order")
+async def confirm_purchase_order(db: AsyncSession, order: PurchaseOrder, tenant_id: str, *, user=None) -> PurchaseOrder:
     if order.state not in ("draft", "sent"):
         raise ValueError(f"Cannot confirm PO in state '{order.state}'")
 
@@ -62,7 +64,8 @@ async def confirm_purchase_order(db: AsyncSession, order: PurchaseOrder, tenant_
     return order
 
 
-async def validate_receipt(db: AsyncSession, order: PurchaseOrder, tenant_id: str) -> PurchaseOrder:
+@audited("purchasing.orders.receive", resource_type="purchase_order")
+async def validate_receipt(db: AsyncSession, order: PurchaseOrder, tenant_id: str, *, user=None) -> PurchaseOrder:
     if order.state != "confirmed":
         raise ValueError("PO must be confirmed before receiving")
 

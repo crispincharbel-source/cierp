@@ -10,6 +10,7 @@ from datetime import datetime
 from app.core.database import get_db
 from app.core.deps import require_auth
 from app.modules.identity.models import User
+from app.modules.identity.permissions import require_permission
 
 # ─── Models ──────────────────────────────────────────────────────
 from app.modules.accounting.models import (
@@ -53,6 +54,20 @@ def row_to_dict(obj):
 
 def get_tenant(user: User = Depends(require_auth)) -> str:
     return user.tenant_id
+
+
+def get_user_and_tenant(user: User = Depends(require_auth)):
+    """Returns (user, tenant_id) tuple for endpoints that need both."""
+    return user, user.tenant_id
+
+
+# ─── Reusable permission-checked dependencies ─────────────────────────────────
+# These replace simple require_auth on action endpoints so that
+# role checks happen at the FastAPI dependency level, not inside handler bodies.
+
+def _perm(code: str):
+    """Shorthand: returns a Depends() that checks one permission code."""
+    return Depends(require_permission(code))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -386,7 +401,8 @@ async def add_invoice_line(inv_id: str, data: InvoiceLineCreate,
     return row_to_dict(line)
 
 @accounting_router.post("/invoices/{inv_id}/post")
-async def post_invoice_endpoint(inv_id: str, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db)):
+async def post_invoice_endpoint(inv_id: str, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db),
+                                _p: User = Depends(require_permission("accounting.invoices.post"))):
     inv = (await db.execute(select(AccountMove).where(AccountMove.id == inv_id, AccountMove.tenant_id == tenant_id))).scalar_one_or_none()
     if not inv: raise HTTPException(404, "Invoice not found")
     try:
@@ -413,13 +429,15 @@ async def list_payments(page: int = 1, limit: int = 20,
     return {"items": [row_to_dict(x) for x in items], "total": total}
 
 @accounting_router.post("/payments", status_code=201)
-async def create_payment(data: PaymentCreate, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db)):
+async def create_payment(data: PaymentCreate, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db),
+                         _p: User = Depends(require_permission("accounting.payments.create"))):
     payment = Payment(**data.model_dump(exclude_none=True), tenant_id=tenant_id)
     db.add(payment); await db.commit(); await db.refresh(payment)
     return row_to_dict(payment)
 
 @accounting_router.post("/payments/{pid}/post")
-async def post_payment_endpoint(pid: str, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db)):
+async def post_payment_endpoint(pid: str, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db),
+                                _p: User = Depends(require_permission("accounting.payments.post"))):
     payment = (await db.execute(select(Payment).where(Payment.id == pid, Payment.tenant_id == tenant_id))).scalar_one_or_none()
     if not payment: raise HTTPException(404, "Not found")
     invoice = None
@@ -523,7 +541,8 @@ async def list_orders(page: int = 1, limit: int = 20, state: Optional[str] = Non
     return {"items": [row_to_dict(x) for x in items], "total": total, "page": page}
 
 @sales_router.post("/orders", status_code=201)
-async def create_order(data: SaleOrderCreate, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db)):
+async def create_order(data: SaleOrderCreate, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db),
+                       _p: User = Depends(require_permission("sales.orders.create"))):
     import uuid
     o = SaleOrder(**data.model_dump(exclude_none=True), tenant_id=tenant_id)
     o.number = f"SO-{datetime.now().year}-{str((await db.execute(select(func.count()).where(SaleOrder.tenant_id == tenant_id))).scalar() + 1).zfill(4)}"
@@ -584,7 +603,8 @@ async def delete_order_line(line_id: str, tenant_id: str = Depends(get_tenant), 
     return 
 
 @sales_router.post("/orders/{oid}/confirm")
-async def confirm_order(oid: str, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db)):
+async def confirm_order(oid: str, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db),
+                        _p: User = Depends(require_permission("sales.orders.confirm"))):
     o = (await db.execute(select(SaleOrder).where(SaleOrder.id == oid, SaleOrder.tenant_id == tenant_id))).scalar_one_or_none()
     if not o: raise HTTPException(404, "Not found")
     try:
@@ -606,7 +626,8 @@ async def validate_order_delivery(oid: str, tenant_id: str = Depends(get_tenant)
         raise HTTPException(400, str(e))
 
 @sales_router.post("/orders/{oid}/create-invoice")
-async def create_order_invoice(oid: str, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db)):
+async def create_order_invoice(oid: str, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db),
+                               _p: User = Depends(require_permission("sales.invoices.create"))):
     o = (await db.execute(select(SaleOrder).where(SaleOrder.id == oid, SaleOrder.tenant_id == tenant_id))).scalar_one_or_none()
     if not o: raise HTTPException(404, "Not found")
     try:
@@ -617,7 +638,8 @@ async def create_order_invoice(oid: str, tenant_id: str = Depends(get_tenant), d
         raise HTTPException(400, str(e))
 
 @sales_router.post("/orders/{oid}/cancel")
-async def cancel_order(oid: str, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db)):
+async def cancel_order(oid: str, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db),
+                       _p: User = Depends(require_permission("sales.orders.cancel"))):
     o = (await db.execute(select(SaleOrder).where(SaleOrder.id == oid, SaleOrder.tenant_id == tenant_id))).scalar_one_or_none()
     if not o: raise HTTPException(404, "Not found")
     if o.state in ("done",): raise HTTPException(400, "Cannot cancel a done order")
@@ -811,7 +833,8 @@ async def list_moves(page: int = 1, limit: int = 20, move_type: Optional[str] = 
     return {"items": [row_to_dict(x) for x in items], "total": total}
 
 @inventory_router.post("/movements", status_code=201)
-async def create_move(data: StockMoveCreate, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db)):
+async def create_move(data: StockMoveCreate, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db),
+                      _p: User = Depends(require_permission("inventory.adjustments.create"))):
     from app.modules.inventory.service import get_or_create_location, update_quant
     # Manual adjustment
     m = StockMove(
@@ -843,7 +866,8 @@ async def list_pickings(page: int = 1, limit: int = 20, picking_type: Optional[s
     return {"items": [row_to_dict(x) for x in items], "total": total}
 
 @inventory_router.post("/pickings/{pid}/validate")
-async def validate_picking_endpoint(pid: str, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db)):
+async def validate_picking_endpoint(pid: str, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db),
+                                    _p: User = Depends(require_permission("inventory.transfers.create"))):
     picking = (await db.execute(select(StockPicking).where(StockPicking.id == pid, StockPicking.tenant_id == tenant_id))).scalar_one_or_none()
     if not picking: raise HTTPException(404, "Not found")
     try:
@@ -901,7 +925,8 @@ async def list_employees(page: int = 1, limit: int = 20, search: Optional[str] =
     return {"items": [row_to_dict(x) for x in items], "total": total, "page": page}
 
 @hr_router.post("/employees", status_code=201)
-async def create_employee(data: EmployeeCreate, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db)):
+async def create_employee(data: EmployeeCreate, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db),
+                          _p: User = Depends(require_permission("hr.employees.create"))):
     count = (await db.execute(select(func.count()).where(Employee.tenant_id == tenant_id))).scalar()
     e = Employee(**data.model_dump(exclude_none=True), tenant_id=tenant_id)
     e.employee_number = f"EMP-{str(count + 1).zfill(4)}"
@@ -923,6 +948,18 @@ async def list_leaves(page: int = 1, limit: int = 20, state: Optional[str] = Non
     total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar()
     items = (await db.execute(q.order_by(LeaveRequest.created_at.desc()).offset((page-1)*limit).limit(limit))).scalars().all()
     return {"items": [row_to_dict(x) for x in items], "total": total}
+
+@hr_router.post("/leaves", status_code=201)
+async def create_leave(data: dict, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db)):
+    leave = LeaveRequest(**{k: v for k, v in data.items() if k not in ("id","tenant_id")}, tenant_id=tenant_id)
+    db.add(leave); await db.commit(); return row_to_dict(leave)
+
+@hr_router.post("/leaves/{lid}/transition")
+async def transition_leave(lid: str, data: dict, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db)):
+    leave = (await db.execute(select(LeaveRequest).where(LeaveRequest.id == lid, LeaveRequest.tenant_id == tenant_id))).scalar_one_or_none()
+    if not leave: raise HTTPException(404, "Leave request not found")
+    leave.state = data.get("state", leave.state)
+    await db.commit(); return row_to_dict(leave)
 
 @hr_router.get("/payslips")
 async def list_payslips(page: int = 1, limit: int = 20,
@@ -1002,7 +1039,8 @@ async def get_production(oid: str, tenant_id: str = Depends(get_tenant), db: Asy
     return result
 
 @manufacturing_router.post("/orders/{oid}/confirm")
-async def confirm_production(oid: str, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db)):
+async def confirm_production(oid: str, tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db),
+                             _p: User = Depends(require_permission("manufacturing.orders.create"))):
     po = (await db.execute(select(ProductionOrder).where(ProductionOrder.id == oid, ProductionOrder.tenant_id == tenant_id))).scalar_one_or_none()
     if not po: raise HTTPException(404, "Not found")
     try:
@@ -1014,7 +1052,8 @@ async def confirm_production(oid: str, tenant_id: str = Depends(get_tenant), db:
 
 @manufacturing_router.post("/orders/{oid}/produce")
 async def produce(oid: str, qty: Optional[float] = None,
-                   tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db)):
+                   tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db),
+                   _p: User = Depends(require_permission("manufacturing.orders.produce"))):
     po = (await db.execute(select(ProductionOrder).where(ProductionOrder.id == oid, ProductionOrder.tenant_id == tenant_id))).scalar_one_or_none()
     if not po: raise HTTPException(404, "Not found")
     try:

@@ -7,6 +7,10 @@ class Settings(BaseSettings):
     # Core
     ENVIRONMENT: str = "development"
 
+    @property
+    def is_production(self) -> bool:
+        return self.ENVIRONMENT.lower() in ("production", "prod")
+
     # DB / Cache
     DATABASE_URL: str = "postgresql+asyncpg://cierp:cierp_pass@postgres:5432/cierp"
     REDIS_URL: str = "redis://redis:6379/0"
@@ -23,7 +27,7 @@ class Settings(BaseSettings):
 
     # Seeded admin (first startup)
     # Default bootstrap admin (can be overridden via env)
-    ADMIN_EMAIL: str = "admin123@cierp.com"
+    ADMIN_EMAIL: str = "admin@cierp.com"
     ADMIN_PASSWORD: str = "admin123"
 
     # CORS (JSON array string or comma-separated)

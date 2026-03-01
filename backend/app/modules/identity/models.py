@@ -49,6 +49,15 @@ class Role(BaseModel):
 
     users = relationship("User", secondary=user_roles, back_populates="roles", lazy="noload")
 
+    # ── DB-backed RBAC: roles carry their permission set ──────────────────────
+    # Populated lazily; use selectinload(Role.permissions) when needed.
+    permissions = relationship(
+        "Permission",
+        secondary="role_permission",
+        back_populates="roles",
+        lazy="noload",
+    )
+
 
 class User(BaseModel):
     __tablename__ = "user"
@@ -72,3 +81,44 @@ class User(BaseModel):
     @property
     def role_codes(self) -> list:
         return [r.code for r in (self.roles or [])]
+
+
+# ─── Audit Log ─────────────────────────────────────────────────────────────────
+from sqlalchemy import Text as TextCol, JSON
+
+class AuditLog(BaseModel):
+    """Global audit log — records every meaningful ERP action."""
+    __tablename__ = "audit_log"
+
+    actor_id       = Column(String(36), nullable=True)
+    actor_email    = Column(String(255), nullable=True)
+    actor_name     = Column(String(200), nullable=True)
+    action         = Column(String(200), nullable=False, index=True)
+    resource_type  = Column(String(100), nullable=True, index=True)
+    resource_id    = Column(String(36), nullable=True)
+    resource_label = Column(String(500), nullable=True)
+    changes        = Column(JSON, nullable=True)        # {"before": {}, "after": {}}
+    ip_address     = Column(String(50), nullable=True)
+    user_agent     = Column(String(500), nullable=True)
+    severity       = Column(String(20), nullable=False, default="info")  # info/warning/critical
+    module         = Column(String(100), nullable=True, index=True)
+    extra          = Column(JSON, nullable=True)
+
+
+# ─── Company Branding / Logo ───────────────────────────────────────────────────
+class CompanyBranding(BaseModel):
+    """Stores company logo and print branding settings per tenant."""
+    __tablename__ = "company_branding"
+
+    company_id      = Column(String(36), ForeignKey("company.id"), nullable=True)
+    logo_data       = Column(Text, nullable=True)          # base64 encoded image
+    logo_filename   = Column(String(255), nullable=True)
+    logo_mime_type  = Column(String(100), nullable=True)
+    report_header   = Column(String(500), nullable=True)   # headline text under logo
+    report_footer   = Column(String(500), nullable=True)
+    primary_color   = Column(String(20), nullable=True, default="#1a3a5c")
+    secondary_color = Column(String(20), nullable=True, default="#2563eb")
+    show_logo_on_reports  = Column(Boolean, default=True)
+    show_logo_on_invoices = Column(Boolean, default=True)
+    show_logo_on_payslips = Column(Boolean, default=True)
+    updated_by      = Column(String(36), nullable=True)

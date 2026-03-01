@@ -9,9 +9,11 @@ import uuid
 from app.modules.sales.models import SaleOrder, SaleOrderLine
 from app.modules.accounting.models import AccountMove, InvoiceLine
 from app.modules.inventory.service import create_delivery_picking, validate_picking
+from app.core.audit import audited
 
 
-async def confirm_sale_order(db: AsyncSession, order: SaleOrder, tenant_id: str) -> SaleOrder:
+@audited("sales.orders.confirm", resource_type="sale_order")
+async def confirm_sale_order(db: AsyncSession, order: SaleOrder, tenant_id: str, *, user=None) -> SaleOrder:
     """
     Confirm a sale order:
     1. Validate lines
@@ -70,7 +72,8 @@ async def confirm_sale_order(db: AsyncSession, order: SaleOrder, tenant_id: str)
     return order
 
 
-async def validate_delivery(db: AsyncSession, order: SaleOrder, tenant_id: str) -> SaleOrder:
+@audited("sales.orders.deliver", resource_type="sale_order")
+async def validate_delivery(db: AsyncSession, order: SaleOrder, tenant_id: str, *, user=None) -> SaleOrder:
     """
     Validate the delivery:
     1. Validate the picking (updates stock)
@@ -100,7 +103,8 @@ async def validate_delivery(db: AsyncSession, order: SaleOrder, tenant_id: str) 
     return order
 
 
-async def create_invoice_from_order(db: AsyncSession, order: SaleOrder, tenant_id: str) -> AccountMove:
+@audited("sales.invoices.create", resource_type="account_move")
+async def create_invoice_from_order(db: AsyncSession, order: SaleOrder, tenant_id: str, *, user=None) -> AccountMove:
     """
     Create customer invoice from a confirmed/done sale order.
     Returns the draft AccountMove (not yet posted).

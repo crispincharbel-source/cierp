@@ -88,3 +88,26 @@ async def global_dashboard(tenant_id: str = Depends(get_tenant), db: AsyncSessio
             "urgent": await cnt(HelpdeskTicket, HelpdeskTicket.priority == "urgent"),
         },
     }
+
+
+@router.get("/kpis")
+async def dashboard_kpis(tenant_id: str = Depends(get_tenant), db: AsyncSession = Depends(get_db)):
+    """Lightweight KPI endpoint for the dashboard overview widgets."""
+    from sqlalchemy import select, func
+    from app.modules.sales.models import SaleOrder, Customer
+    from app.modules.helpdesk.models import HelpdeskTicket
+
+    async def cnt(model, *filters):
+        q = select(func.count()).select_from(model).where(
+            model.tenant_id == tenant_id,
+            model.is_deleted == False,
+            *filters,
+        )
+        return (await db.execute(q)).scalar() or 0
+
+    return {
+        "total_orders":    await cnt(SaleOrder),
+        "active_orders":   await cnt(SaleOrder, SaleOrder.state.in_(["draft", "confirmed"])),
+        "total_customers": await cnt(Customer),
+        "open_tickets":    await cnt(HelpdeskTicket, HelpdeskTicket.state.in_(["new", "open"])),
+    }

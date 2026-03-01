@@ -1,70 +1,147 @@
+version: "3.9"
+
 services:
+
+  # ─── PostgreSQL ─────────────────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
-    container_name: cierp_db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: cierp
+      POSTGRES_USER:     cierp
       POSTGRES_PASSWORD: cierp_pass
-      POSTGRES_DB: cierp
+      POSTGRES_DB:       cierp
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
-    ports:
-      - "5433:5432"
+      - pg_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U cierp"]
+      test:     ["CMD-SHELL", "pg_isready -U cierp"]
       interval: 5s
-      timeout: 5s
-      retries: 10
+      timeout:  5s
+      retries:  10
 
+  # ─── Redis ──────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
-    container_name: cierp_redis
     restart: unless-stopped
-    ports:
-      - "6379:6379"
+    command: >
+      redis-server --appendonly yes
+                   --maxmemory 256mb
+                   --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test:     ["CMD", "redis-cli", "ping"]
       interval: 5s
-      timeout: 3s
-      retries: 5
+      timeout:  3s
+      retries:  5
 
+  # ─── CI ERP FastAPI Backend ─────────────────────────────────────────────────
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: cierp_api
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql+asyncpg://cierp:cierp_pass@postgres:5432/cierp
-      REDIS_URL: redis://redis:6379/0
-      JWT_SECRET: cierp-super-secret-key-change-in-production
-      ENVIRONMENT: development
-      CORS_ORIGINS: '["http://localhost:3000","http://localhost"]'
-    volumes:
-      - ./backend:/app
+      DATABASE_URL:   postgresql+asyncpg://cierp:cierp_pass@postgres:5432/cierp
+      REDIS_URL:      redis://redis:6379/0
+      JWT_SECRET:     change-me-in-production-minimum-32-characters-long
+      ADMIN_EMAIL:    admin@cierp.com
+      ADMIN_PASSWORD: admin123
+      COMPANY_NAME:   CI ERP
+      COMPANY_CODE:   CIERP
+      TENANT_ID:      cierp
+      CORS_ORIGINS:   '["http://localhost:3000","http://frontend"]'
+      ENVIRONMENT:    production
+      FILE_STORAGE:   local
+      # Uncomment for S3:
+      # S3_BUCKET:    my-cierp-bucket
+      # S3_REGION:    us-east-1
+      # S3_ACCESS_KEY: ...
+      # S3_SECRET_KEY: ...
     ports:
       - "8000:8000"
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    volumes:
+      - uploads_data:/app/uploads
 
+  # ─── CI ERP Background Worker ────────────────────────────────────────────────
+  # Dedicated process for email, PDF generation, payroll and report jobs.
+  # Scale horizontally: docker-compose up --scale worker=3
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.core.jobs.worker"]
+    environment:
+      DATABASE_URL:   postgresql+asyncpg://cierp:cierp_pass@postgres:5432/cierp
+      REDIS_URL:      redis://redis:6379/0
+      JWT_SECRET:     change-me-in-production-minimum-32-characters-long
+      TENANT_ID:      cierp
+      ENVIRONMENT:    production
+      LOG_LEVEL:      INFO
+      WORKER_POLL:    "2.0"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    volumes:
+      - uploads_data:/app/uploads
+
+  # ─── React Frontend ─────────────────────────────────────────────────────────
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-      args:
-        VITE_API_BASE: /api/v1
-    container_name: cierp_frontend
     restart: unless-stopped
     ports:
       - "3000:80"
     depends_on:
       - backend
 
+  # ─── Order Tracking Node.js API ─────────────────────────────────────────────
+  order-tracking-api:
+    build: ./order-tracking/backend
+    restart: unless-stopped
+    environment:
+      PORT:          5050
+      DB_HOST:       order-tracking-mysql
+      DB_PORT:       3306
+      DB_USER:       otuser
+      DB_PASS:       otpass
+      DB_NAME:       order_tracking
+      JWT_SECRET:    change-me-in-production
+      CORS_ORIGINS:  "http://localhost:3000,http://frontend"
+      NODE_ENV:      production
+    ports:
+      - "5050:5050"
+    depends_on:
+      order-tracking-mysql: { condition: service_healthy }
+
+  # ─── MySQL for Order Tracking ────────────────────────────────────────────────
+  order-tracking-mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_USER:          otuser
+      MYSQL_PASSWORD:      otpass
+      MYSQL_DATABASE:      order_tracking
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./order-tracking/database/01-schema.sql:/docker-entrypoint-initdb.d/01.sql:ro
+      - ./order-tracking/database/02-seed-data.sql:/docker-entrypoint-initdb.d/02.sql:ro
+      - ./order-tracking/database/03-add-new-complex-fileds.sql:/docker-entrypoint-initdb.d/03.sql:ro
+      - ./order-tracking/database/04-add-extruder.sql:/docker-entrypoint-initdb.d/04.sql:ro
+    healthcheck:
+      test:     ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout:  5s
+      retries:  10
+
 volumes:
-  postgres_data:
+  pg_data:
+  redis_data:
+  mysql_data:
+  uploads_data:

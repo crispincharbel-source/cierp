@@ -1,208 +1,303 @@
+"""
+CI ERP — Order Tracking API
+All queries are TENANT-SCOPED: every production-stage table filters by
+tenant_id so one tenant can never see another tenant's orders.
+"""
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, or_, func, and_
+from typing import Optional
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from sqlalchemy import text, union_all
-from typing import List, Dict, Any
+from app.core.database import get_db
+from app.core.deps import require_auth
+from app.modules.identity.models import User
+from app.modules.identity.permissions import require_permission
+from app.modules.order_tracking.models import (
+    Cutting, Lamination, Printing,
+    WarehouseToDispatch, DispatchToProduction,
+    Extruder, RawSlitting, PVC, Slitting,
+    OTInk, OTSolvent, OTComplex, OTActivityLog, OTAdminSettings,
+)
 
-from backend.app.core.deps import get_db
-from backend.app.modules.order_tracking import models
-
-router = APIRouter()
-
-
-async def get_order_tracking_fields_config(db: Session) -> Dict[str, List[str]]:
-    """Helper function to get order tracking fields configuration"""
-    try:
-        setting = (
-            db.query(models.AdminSettings)
-            .filter(models.AdminSettings.setting_key == "order-tracking-fields")
-            .first()
-        )
-        if setting and setting.setting_value:
-            try:
-                config = setting.setting_value
-
-                # Create a normalized mapping between model names and config keys
-                normalized_config = {
-                    "Cutting": config.get("cutting", []),
-                    "Lamination": config.get("lamination", []),
-                    "Printing": config.get("printing", []),
-                    "WarehouseToDispatch": config.get("warehouse_to_dispatch", []),
-                    "DispatchToProduction": config.get("dispatch_to_production", []),
-                    "Extruder": config.get("extruder", []),
-                    "RawSlitting": config.get("raw_slitting", []),
-                    "PVC": config.get("pvc", []),
-                    "Slitting": config.get("slitting", []),
-                }
-
-                return normalized_config
-            except Exception as e:
-                print(f"Error parsing order tracking fields: {e}")
-
-        # Default configuration (include all fields)
-        return {
-            "Cutting": [],
-            "Lamination": [],
-            "Printing": [],
-            "WarehouseToDispatch": [],
-            "DispatchToProduction": [],
-            "Extruder": [],
-            "RawSlitting": [],
-            "PVC": [],
-            "Slitting": [],
-        }
-    except Exception as e:
-        print(f"Error getting order tracking fields config: {e}")
-        return {}
+router = APIRouter(tags=["Order Tracking"])
 
 
-async def fetch_table_data(
-    db: Session,
-    model: Any,
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _row(obj) -> dict:
+    """Convert SQLAlchemy row to dict, serialising dates."""
+    d = {}
+    for c in obj.__table__.columns:
+        v = getattr(obj, c.name)
+        if hasattr(v, "isoformat"):
+            v = v.isoformat()
+        d[c.name] = v
+    return d
+
+
+def _tenant_filter(model, tenant_id: str):
+    """
+    Standard tenant + soft-delete filter for OTBase tables.
+    Returns a SQLAlchemy clause.
+    """
+    return and_(
+        model.tenant_id == tenant_id,
+        model.is_deleted == False,
+    )
+
+
+# ─── Stage model map ─────────────────────────────────────────────────────────
+STAGE_MAP = {
+    "cutting":              Cutting,
+    "lamination":           Lamination,
+    "printing":             Printing,
+    "warehouseToDispatch":  WarehouseToDispatch,
+    "dispatchToProduction": DispatchToProduction,
+    "extruder":             Extruder,
+    "rawSlitting":          RawSlitting,
+    "pvc":                  PVC,
+    "slitting":             Slitting,
+}
+
+
+# ─── Core tracking endpoints ─────────────────────────────────────────────────
+
+@router.get("/track/{order_number}")
+async def track_order(
     order_number: str,
-    include_fields: List[str] = [],
-) -> List[Dict[str, Any]]:
-    """Helper function to fetch order data from a specific table"""
-    try:
-        # Determine attributes to include
-        if include_fields:
-            attributes = [
-                getattr(model, field)
-                for field in include_fields
-                if hasattr(model, field)
-            ]
-        else:
-            attributes = [c for c in model.__table__.columns]
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_auth),
+):
+    """Return all production records for a given order number — tenant-scoped."""
+    tid = user.tenant_id
+    result: dict = {"orderNumber": order_number, "orderData": {}}
+    found_any = False
 
-        # Ensure order_number is always included
-        if "order_number" not in [attr.name for attr in attributes]:
-            attributes.append(model.order_number)
+    for key, model in STAGE_MAP.items():
+        rows = (await db.execute(
+            select(model).where(
+                and_(_tenant_filter(model, tid), model.order_number == order_number)
+            )
+        )).scalars().all()
+        result["orderData"][key] = [_row(r) for r in rows]
+        if rows:
+            found_any = True
 
-        # Fetch data
-        data = db.query(*attributes).filter(model.order_number == order_number).all()
+    if not found_any:
+        raise HTTPException(404, f"No production data found for order: {order_number}")
 
-        return [dict(row._mapping) for row in data]
-    except Exception as e:
-        print(f"Error fetching data from {model.__name__}: {e}")
-        return []
+    return result
 
 
-@router.get("/track/{order_number}", response_model=Dict[str, Any])
-async def track_order(order_number: str, db: Session = Depends(get_db)):
-    """Track order across all tables"""
-    if not order_number:
-        raise HTTPException(status_code=400, detail="Order number is required")
+@router.get("/search")
+async def search_orders(
+    query: str = Query(..., min_length=1),
+    limit: int = Query(10, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_auth),
+):
+    """Autocomplete search across all stage tables — tenant-scoped."""
+    tid = user.tenant_id
+    pat = f"%{query}%"
+    seen: dict[str, set] = {}
 
-    # Get display fields configuration
-    fields_config = await get_order_tracking_fields_config(db)
+    for key, model in STAGE_MAP.items():
+        rows = (await db.execute(
+            select(model.order_number)
+            .where(and_(
+                _tenant_filter(model, tid),
+                model.order_number.ilike(pat),
+            ))
+            .distinct()
+            .limit(limit)
+        )).scalars().all()
+        for on in rows:
+            if on not in seen:
+                seen[on] = set()
+            seen[on].add(key)
 
-    # Fetch data from all tables related to the order number
-    cutting_data = await fetch_table_data(
-        db, models.Cutting, order_number, fields_config.get("Cutting", [])
-    )
-    lamination_data = await fetch_table_data(
-        db, models.Lamination, order_number, fields_config.get("Lamination", [])
-    )
-    printing_data = await fetch_table_data(
-        db, models.Printing, order_number, fields_config.get("Printing", [])
-    )
-    warehouse_to_dispatch_data = await fetch_table_data(
-        db,
-        models.WarehouseToDispatch,
-        order_number,
-        fields_config.get("WarehouseToDispatch", []),
-    )
-    dispatch_to_production_data = await fetch_table_data(
-        db,
-        models.DispatchToProduction,
-        order_number,
-        fields_config.get("DispatchToProduction", []),
-    )
-    extruder_data = await fetch_table_data(
-        db, models.Extruder, order_number, fields_config.get("Extruder", [])
-    )
-    raw_slitting_data = await fetch_table_data(
-        db, models.RawSlitting, order_number, fields_config.get("RawSlitting", [])
-    )
-    pvc_data = await fetch_table_data(
-        db, models.PVC, order_number, fields_config.get("PVC", [])
-    )
-    slitting_data = await fetch_table_data(
-        db, models.Slitting, order_number, fields_config.get("Slitting", [])
-    )
+    results = [
+        {"order_number": on, "sources": sorted(srcs)}
+        for on, srcs in seen.items()
+    ]
+    results.sort(key=lambda x: x["order_number"])
+    return {"results": results[:limit], "total": len(results)}
 
-    # Combine all data
-    order_data = {
-        "orderNumber": order_number,
-        "cutting": cutting_data,
-        "lamination": lamination_data,
-        "printing": printing_data,
-        "warehouseToDispatch": warehouse_to_dispatch_data,
-        "dispatchToProduction": dispatch_to_production_data,
-        "extruder": extruder_data,
-        "rawSlitting": raw_slitting_data,
-        "pvc": pvc_data,
-        "slitting": slitting_data,
+
+@router.get("/stats")
+async def order_stats(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_auth),
+):
+    """Record counts per stage table — tenant-scoped."""
+    tid = user.tenant_id
+    counts = {}
+    for key, model in STAGE_MAP.items():
+        cnt = (await db.execute(
+            select(func.count()).select_from(model).where(_tenant_filter(model, tid))
+        )).scalar()
+        counts[key] = cnt or 0
+    return {"stats": counts, "total": sum(counts.values())}
+
+
+@router.get("/orders")
+async def list_orders(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_auth),
+):
+    """List distinct order numbers for this tenant."""
+    tid = user.tenant_id
+    # Query across all stages to get all known order numbers
+    all_orders: set[str] = set()
+    for model in STAGE_MAP.values():
+        rows = (await db.execute(
+            select(model.order_number)
+            .where(_tenant_filter(model, tid))
+            .distinct()
+        )).scalars().all()
+        all_orders.update(rows)
+
+    sorted_orders = sorted(all_orders)
+    total = len(sorted_orders)
+    start = (page - 1) * page_size
+    page_items = sorted_orders[start: start + page_size]
+
+    return {
+        "items": [{"order_number": on} for on in page_items],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
     }
 
-    return {"orderData": order_data}
 
+# ─── Reference data (shared, no tenant filter needed) ────────────────────────
 
-@router.get("/search", response_model=Dict[str, Any])
-async def search_orders(
-    query: str, limit: int = 20, db: Session = Depends(get_db)
+@router.get("/ink")
+async def list_ink(
+    search: Optional[str] = None,
+    finished: Optional[bool] = None,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_auth),
 ):
-    """Search orders"""
-    if not query or len(query) < 2:
-        raise HTTPException(
-            status_code=400, detail="Search query must be at least 2 characters"
+    q = select(OTInk)
+    if search:
+        q = q.where(or_(
+            OTInk.code_number.ilike(f"%{search}%"),
+            OTInk.supplier.ilike(f"%{search}%"),
+            OTInk.color.ilike(f"%{search}%"),
+        ))
+    if finished is not None:
+        q = q.where(OTInk.is_finished == finished)
+    rows = (await db.execute(q.limit(200))).scalars().all()
+    return {"items": [_row(r) for r in rows], "total": len(rows)}
+
+
+@router.get("/solvent")
+async def list_solvent(
+    search: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_auth),
+):
+    q = select(OTSolvent)
+    if search:
+        q = q.where(or_(
+            OTSolvent.code_number.ilike(f"%{search}%"),
+            OTSolvent.supplier.ilike(f"%{search}%"),
+            OTSolvent.product.ilike(f"%{search}%"),
+        ))
+    rows = (await db.execute(q.limit(200))).scalars().all()
+    return {"items": [_row(r) for r in rows], "total": len(rows)}
+
+
+@router.get("/complex")
+async def list_complex(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_auth),
+):
+    rows = (await db.execute(select(OTComplex))).scalars().all()
+    return {"items": [{"id": r.id, "desc": r.desc} for r in rows]}
+
+
+# ─── Admin settings (tenant-scoped) ──────────────────────────────────────────
+
+@router.get("/admin/settings")
+async def get_settings(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_auth),
+):
+    tid = user.tenant_id
+    rows = (await db.execute(
+        select(OTAdminSettings).where(_tenant_filter(OTAdminSettings, tid))
+    )).scalars().all()
+    return {"settings": {r.setting_key: r.setting_value for r in rows}}
+
+
+@router.put("/admin/settings/{key}")
+async def update_setting(
+    key: str,
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_auth),
+    _p: User = Depends(require_permission("order_tracking.admin")),
+):
+    tid = user.tenant_id
+    row = (await db.execute(
+        select(OTAdminSettings).where(
+            and_(_tenant_filter(OTAdminSettings, tid), OTAdminSettings.setting_key == key)
         )
+    )).scalar_one_or_none()
 
-    search_term = f"%%{query}%%"
+    if row:
+        row.setting_value   = body.get("value")
+        row.last_updated_by = user.email
+    else:
+        db.add(OTAdminSettings(
+            tenant_id           = tid,
+            setting_key         = key,
+            setting_value       = body.get("value"),
+            setting_description = body.get("description"),
+            last_updated_by     = user.email,
+        ))
+    await db.commit()
+    return {"key": key, "value": body.get("value")}
 
-    # Search for orders across all tables
-    queries = [
-        db.query(models.Cutting.order_number, text("'cutting' as source")).filter(
-            models.Cutting.order_number.like(search_term)
-        ),
-        db.query(
-            models.Lamination.order_number, text("'lamination' as source")
-        ).filter(models.Lamination.order_number.like(search_term)),
-        db.query(models.Printing.order_number, text("'printing' as source")).filter(
-            models.Printing.order_number.like(search_term)
-        ),
-        db.query(
-            models.WarehouseToDispatch.order_number,
-            text("'warehouse_to_dispatch' as source"),
-        ).filter(models.WarehouseToDispatch.order_number.like(search_term)),
-        db.query(
-            models.DispatchToProduction.order_number,
-            text("'dispatch_to_production' as source"),
-        ).filter(models.DispatchToProduction.order_number.like(search_term)),
-        db.query(models.Extruder.order_number, text("'extruder' as source")).filter(
-            models.Extruder.order_number.like(search_term)
-        ),
-        db.query(
-            models.RawSlitting.order_number, text("'raw_slitting' as source")
-        ).filter(models.RawSlitting.order_number.like(search_term)),
-        db.query(models.PVC.order_number, text("'pvc' as source")).filter(
-            models.PVC.order_number.like(search_term)
-        ),
-        db.query(models.Slitting.order_number, text("'slitting' as source")).filter(
-            models.Slitting.order_number.like(search_term)
-        ),
-    ]
 
-    # Combine all queries
-    combined_query = union_all(*queries)
-    results = db.execute(combined_query.limit(limit)).fetchall()
+# ─── Activity log (tenant-scoped) ────────────────────────────────────────────
 
-    # Remove duplicates
-    unique_results = list(
-        {
-            result.order_number: {"order_number": result.order_number, "source": result.source}
-            for result in results
-        }.values()
+@router.get("/activity-log")
+async def activity_log(
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_auth),
+):
+    tid = user.tenant_id
+    rows = (await db.execute(
+        select(OTActivityLog)
+        .where(_tenant_filter(OTActivityLog, tid))
+        .order_by(OTActivityLog.timestamp.desc())
+        .limit(limit)
+    )).scalars().all()
+    return {"logs": [_row(r) for r in rows]}
+
+
+@router.post("/activity-log")
+async def log_activity(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_auth),
+):
+    """Record an order tracking action in the per-tenant activity log."""
+    entry = OTActivityLog(
+        tenant_id  = user.tenant_id,
+        user_email = user.email,
+        action     = body.get("action", "unknown"),
+        table_name = body.get("table_name", ""),
+        record_id  = str(body.get("record_id", "")),
+        details    = body.get("details"),
     )
-
-    return {"results": unique_results}
+    db.add(entry)
+    await db.commit()
+    return {"status": "logged"}

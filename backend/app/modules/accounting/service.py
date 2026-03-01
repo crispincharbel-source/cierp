@@ -10,6 +10,7 @@ import uuid
 from app.modules.accounting.models import (
     Account, AccountMove, AccountMoveLine, InvoiceLine, Payment, Journal
 )
+from app.core.audit import audited
 
 
 async def get_or_create_account(db: AsyncSession, tenant_id: str, code: str,
@@ -24,7 +25,8 @@ async def get_or_create_account(db: AsyncSession, tenant_id: str, code: str,
     return acc
 
 
-async def post_invoice(db: AsyncSession, move: AccountMove, tenant_id: str) -> AccountMove:
+@audited("accounting.invoices.post", resource_type="account_move", severity="info")
+async def post_invoice(db: AsyncSession, move: AccountMove, tenant_id: str, *, user=None) -> AccountMove:
     """
     Post an invoice: compute totals from lines, create double-entry move lines.
     out_invoice: DR Accounts Receivable / CR Revenue + Tax Payable
@@ -176,8 +178,9 @@ async def post_invoice(db: AsyncSession, move: AccountMove, tenant_id: str) -> A
     return move
 
 
+@audited("accounting.payments.post", resource_type="payment", severity="info")
 async def post_payment(db: AsyncSession, payment: Payment, tenant_id: str,
-                        invoice: AccountMove = None) -> Payment:
+                        invoice: AccountMove = None, *, user=None) -> Payment:
     """
     Post a payment and optionally reconcile against an invoice.
     inbound:  DR Bank/Cash / CR Accounts Receivable

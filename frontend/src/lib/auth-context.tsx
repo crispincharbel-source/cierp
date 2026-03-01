@@ -1,5 +1,10 @@
+/**
+ * CI ERP Auth Context — uses real backend API for authentication.
+ * POST /api/v1/auth/login  → { access_token, user }
+ * GET  /api/v1/auth/me     → { user }
+ */
 import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
-import { getManagedUsers } from "./store";
+import { apiFetch, saveAuth, clearAuth } from "./api";
 
 export type AuthUser = {
   id: string;
@@ -23,7 +28,6 @@ type AuthContextValue = {
 };
 
 const AuthContext = createContext<AuthContextValue | null>(null);
-
 const LS_KEY = "ci_erp_auth";
 
 function readStored(): StoredAuth | null {
@@ -32,13 +36,8 @@ function readStored(): StoredAuth | null {
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed?.token) return null;
-    return {
-      token: String(parsed.token),
-      tenant_id: parsed?.tenant_id ? String(parsed.tenant_id) : undefined,
-    };
-  } catch {
-    return null;
-  }
+    return { token: String(parsed.token), tenant_id: parsed?.tenant_id ?? undefined };
+  } catch { return null; }
 }
 
 function writeStored(data: StoredAuth | null) {
@@ -47,37 +46,32 @@ function writeStored(data: StoredAuth | null) {
 }
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [token, setToken] = useState<string | null>(null);
+  const [token, setToken]     = useState<string | null>(null);
   const [tenantId, setTenantId] = useState<string | null>(null);
-  const [user, setUser] = useState<AuthUser | null>(null);
+  const [user, setUser]       = useState<AuthUser | null>(null);
   const [isReady, setIsReady] = useState(false);
 
-  const hydrateMe = async (nextToken: string, preferredTenantId?: string | null) => {
-    const users = getManagedUsers();
-    const matchedUser = users.find(u => u.email === 'admin@cierp.com');
-    if (!matchedUser) throw new Error('User not found');
-    const me = { user: { ...matchedUser, company_id: 'cierp', company_code: 'CI', roles: ['admin'], is_superadmin: true } };
-    const resolvedTenantId = me.user.company_id;
-    writeStored({ token: nextToken, tenant_id: resolvedTenantId });
-    setTenantId(resolvedTenantId);
-    setUser(me.user);
-    return { me, resolvedTenantId };
+  // Fetch user profile from real backend
+  const fetchMe = async (tok: string): Promise<AuthUser> => {
+    const data = await apiFetch<{ user: AuthUser }>("/auth/me", { token: tok });
+    return data.user;
   };
 
-  // Rehydrate on boot, then call /auth/me before rendering protected pages
+  // Rehydrate session on mount
   useEffect(() => {
     const stored = readStored();
-    if (!stored) {
-      setIsReady(true);
-      return;
-    }
+    if (!stored) { setIsReady(true); return; }
+
     setToken(stored.token);
-    setTenantId(stored.tenant_id || null);
+    setTenantId(stored.tenant_id ?? null);
 
     (async () => {
       try {
-        await hydrateMe(stored.token, stored.tenant_id || null);
-      } catch (e) {
+        const me = await fetchMe(stored.token);
+        setUser(me);
+        setTenantId(me.company_id);
+      } catch {
+        // Token expired or invalid — clear session
         writeStored(null);
         setToken(null);
         setTenantId(null);
@@ -89,27 +83,30 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const login = async (email: string, password: string) => {
-    const users = getManagedUsers();
-    const matchedUser = users.find(u => u.email === email);
-    if (!matchedUser) throw new Error('Invalid credentials');
+    const resp = await apiFetch<{ access_token: string; user: AuthUser }>("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ email, password }),
+    });
 
-    const nextToken = 'mock-token';
-    const nextTenant = 'cierp';
+    const tok      = resp.access_token;
+    const me       = resp.user;
+    const tenantId = me.company_id || "cierp";
 
-    setToken(nextToken);
+    writeStored({ token: tok, tenant_id: tenantId });
+    saveAuth({ token: tok, tenant_id: tenantId });
 
-    if (nextTenant && matchedUser) {
-      writeStored({ token: nextToken, tenant_id: nextTenant });
-      setTenantId(nextTenant);
-      setUser({ ...matchedUser, company_id: 'cierp', company_code: 'CI', roles: ['admin'], is_superadmin: true });
-      return;
-    }
-
-    await hydrateMe(nextToken, nextTenant || null);
+    setToken(tok);
+    setTenantId(tenantId);
+    setUser(me);
   };
 
   const logout = async () => {
+    // Best-effort server-side logout
+    try {
+      if (token) await apiFetch("/auth/logout", { method: "POST", token });
+    } catch { /* ignore */ }
     writeStored(null);
+    clearAuth();
     setToken(null);
     setTenantId(null);
     setUser(null);

@@ -29,7 +29,7 @@ class Base(DeclarativeBase):
 
 
 class BaseModel(Base):
-    """Every table gets: UUID PK, tenant_id, timestamps, soft-delete."""
+    """Every table: UUID PK, tenant_id, timestamps, soft-delete."""
     __abstract__ = True
 
     id = Column(String(36), primary_key=True, default=lambda: str(_uuid.uuid4()))
@@ -54,17 +54,19 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 async def create_tables():
     """Import all models then create tables."""
-    import app.modules.identity.models  # noqa
-    import app.modules.accounting.models  # noqa
-    import app.modules.sales.models  # noqa
-    import app.modules.crm.models  # noqa
-    import app.modules.purchasing.models  # noqa
-    import app.modules.inventory.models  # noqa
-    import app.modules.hr.models  # noqa
-    import app.modules.manufacturing.models  # noqa
-    import app.modules.projects.models  # noqa
-    import app.modules.helpdesk.models  # noqa
-    import app.modules.order_tracking.models # noqa
+    import app.modules.identity.models           # noqa
+    import app.modules.identity.permissions_models  # noqa — Permission + role_permission
+    import app.modules.accounting.models         # noqa
+    import app.modules.sales.models              # noqa
+    import app.modules.crm.models                # noqa
+    import app.modules.purchasing.models         # noqa
+    import app.modules.inventory.models          # noqa
+    import app.modules.hr.models                 # noqa
+    import app.modules.manufacturing.models      # noqa
+    import app.modules.projects.models           # noqa
+    import app.modules.helpdesk.models           # noqa
+    import app.modules.order_tracking.models     # noqa
+    import app.modules.payroll.models            # noqa
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

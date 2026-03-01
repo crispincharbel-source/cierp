@@ -2,6 +2,7 @@
 Manufacturing workflow: Draft → Confirm (reserve components) → Produce → Done (stock moves)
 """
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.audit import audited
 from sqlalchemy import select
 from datetime import datetime, timezone
 
@@ -14,7 +15,8 @@ from app.modules.inventory.service import (
 )
 
 
-async def confirm_production_order(db: AsyncSession, order: ProductionOrder, tenant_id: str) -> ProductionOrder:
+@audited("manufacturing.orders.confirm", resource_type="production_order")
+async def confirm_production_order(db: AsyncSession, order: ProductionOrder, tenant_id: str, *, user=None) -> ProductionOrder:
     """
     Confirm MO:
     1. Load BOM lines → create ProductionOrderLines
@@ -106,8 +108,9 @@ async def confirm_production_order(db: AsyncSession, order: ProductionOrder, ten
     return order
 
 
+@audited("manufacturing.orders.produce", resource_type="production_order", severity="info")
 async def produce_order(db: AsyncSession, order: ProductionOrder, tenant_id: str,
-                         qty_produced: float = None) -> ProductionOrder:
+                         qty_produced: float = None, *, user=None) -> ProductionOrder:
     """
     Mark production as done:
     1. Consume components (validate component picking)

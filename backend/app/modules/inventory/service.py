@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import uuid
 
+from app.core.audit import audited
 from app.modules.inventory.models import (
     Product, StockMove, StockPicking, StockLocation, StockQuant, Warehouse
 )
@@ -69,7 +70,8 @@ async def update_quant(db: AsyncSession, tenant_id: str,
     await db.flush()
 
 
-async def validate_picking(db: AsyncSession, picking: StockPicking, tenant_id: str) -> StockPicking:
+@audited("inventory.transfers.validate", resource_type="stock_picking", severity="info")
+async def validate_picking(db: AsyncSession, picking: StockPicking, tenant_id: str, *, user=None) -> StockPicking:
     """Validate a transfer: set all moves to done and update quants."""
     if picking.state in ("done", "cancelled"):
         raise ValueError(f"Picking already {picking.state}")
